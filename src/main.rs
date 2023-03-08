@@ -9,7 +9,11 @@ use std::cell::RefCell;
 use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
-use tonic_lnd::{Client, ConnectError};
+use tonic_lnd::{tonic::Code, Client, ConnectError};
+
+const ONION_FEATURE_BIT: u32 = 39;
+const SERVICE_UNIMPLEMENTED: &str = "Peer or sign service is unimplemented. Remember to
+	 enable the peerrpc/signrpc services when building LND with make tags='peerrpc signrpc'";
 
 #[tokio::main]
 async fn main() {
@@ -19,6 +23,7 @@ async fn main() {
     };
 
     let mut client = get_lnd_client(args).expect("failed to connect");
+    let mut client_clone = client.clone();
 
     let info = client
         .lightning()
@@ -26,10 +31,16 @@ async fn main() {
         .await
         .expect("failed to get info");
 
-    let pubkey = PublicKey::from_str(&info.into_inner().identity_pubkey).unwrap();
+    let info_clone = info.into_inner().clone();
+    let info_clone_2 = info_clone.clone();
+    if !info_clone.features.contains_key(&ONION_FEATURE_BIT) {
+        set_feature_bit(client).await;
+    }
+
+    let pubkey = PublicKey::from_str(&info_clone_2.identity_pubkey).unwrap();
     println!("Starting lndk for node: {pubkey}");
 
-    let _node_signer = LndNodeSigner::new(pubkey, client.signer());
+    let _node_signer = LndNodeSigner::new(pubkey, client_clone.signer());
 }
 
 struct LndNodeSigner<'a> {
@@ -184,4 +195,54 @@ fn parse_args() -> Result<LndCfg, ArgsError> {
     };
 
     Ok(LndCfg::new(address, cert_file, macaroon_file))
+}
+
+/// Sets the onion messaging feature bit (described in this PR:
+/// https://github.com/lightning/bolts/pull/759/), to signal that we support
+/// onion messaging. This needs to be done every time we start up, because LND
+/// does not currently persist the custom feature bits that are set via the RPC.
+async fn set_feature_bit(mut client: Client) {
+    let onion_feature_bit = 39;
+    let update = tonic_lnd::peersrpc::UpdateFeatureAction {
+        action: i32::from(tonic_lnd::peersrpc::UpdateAction::Add),
+        feature_bit: onion_feature_bit,
+    };
+    let feature_updates = vec![update];
+    let address_updates = vec![];
+
+    let resp = client
+        .peers()
+        .update_node_announcement(tonic_lnd::peersrpc::NodeAnnouncementUpdateRequest {
+            feature_updates,
+            color: String::from(""),
+            alias: String::from(""),
+            address_updates,
+        })
+        .await;
+
+    match resp {
+        Ok(_) => {
+            println!("Now setting the onion messaging feature bit...")
+        }
+        Err(status) => {
+            if status.code() == Code::Unimplemented {
+                panic!("{}", SERVICE_UNIMPLEMENTED);
+            }
+
+            panic!("error updating node announcement {}", status);
+        }
+    };
+
+    // Call get_info again to check the bit was actually set.
+    let info = client
+        .lightning()
+        .get_info(tonic_lnd::lnrpc::GetInfoRequest {})
+        .await
+        .expect("failed to get info");
+
+    if !info.into_inner().features.contains_key(&ONION_FEATURE_BIT) {
+        panic!("onion messaging feature bit failed to be set")
+    }
+
+    println!("Successfully set onion messaging bit");
 }
