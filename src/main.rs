@@ -18,8 +18,9 @@ use std::fs::File;
 use std::io::Read;
 use std::marker::Copy;
 use std::str::FromStr;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, SendError, Sender};
 use std::thread;
+use tonic_lnd::tonic::Status;
 use tonic_lnd::{Client, ConnectError};
 
 #[tokio::main]
@@ -90,6 +91,71 @@ async fn main() {
     });
 
     messenger_events_handler.join().unwrap();
+}
+
+#[derive(Debug)]
+enum MessengerError {
+    SendError(SendError<MessengerEvents>),
+    StreamError(MessengerEvents),
+}
+
+impl Error for MessengerError {}
+
+impl fmt::Display for MessengerError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            MessengerError::SendError(e) => write!(f, "Error sending messenger event: {e}"),
+            MessengerError::StreamError(s) => write!(f, "LND stream {s} exited"),
+        }
+    }
+}
+
+trait PeerEventProducer {
+    fn receive(&mut self) -> Result<tonic_lnd::lnrpc::PeerEvent, Status>;
+}
+
+fn produce_peer_events(
+    mut source: impl PeerEventProducer,
+    events: Sender<MessengerEvents>,
+) -> Result<(), MessengerError> {
+    loop {
+        match source.receive() {
+            Ok(peer_event) => match peer_event.r#type() {
+                tonic_lnd::lnrpc::peer_event::EventType::PeerOnline => {
+                    // TODO: need to lookup whether the peer supports onion messaging (describegraph?) to provide input
+                    // here.
+                    let event = MessengerEvents::PeerConnected(
+                        PublicKey::from_str(&peer_event.pub_key).unwrap(),
+                        true,
+                    );
+                    match events.send(event) {
+                        Ok(_) => debug!("peer events sent: {event}"),
+                        Err(err) => return Err(MessengerError::SendError(err)),
+                    };
+                }
+                tonic_lnd::lnrpc::peer_event::EventType::PeerOffline => {
+                    let event = MessengerEvents::PeerDisconnected(
+                        PublicKey::from_str(&peer_event.pub_key).unwrap(),
+                    );
+                    match events.send(event) {
+                        Ok(_) => debug!("peer events sent: {event}"),
+                        Err(err) => return Err(MessengerError::SendError(err)),
+                    };
+                }
+            },
+            Err(s) => {
+                debug!("peer events receive failed: {s}");
+
+                let event = MessengerEvents::ProducerExit(Producer::PeerEvents);
+                match events.send(event) {
+                    Ok(_) => debug!("peer events sent: {event}"),
+                    Err(err) => error!("peer events: send producer exit failed: {err}"),
+                }
+
+                return Err(MessengerError::StreamError(event));
+            }
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
