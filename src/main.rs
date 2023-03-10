@@ -114,6 +114,22 @@ trait PeerEventProducer {
     fn receive(&mut self) -> Result<tonic_lnd::lnrpc::PeerEvent, Status>;
 }
 
+struct PeerStream {
+    peer_subscription: tonic_lnd::tonic::Streaming<tonic_lnd::lnrpc::PeerEvent>,
+}
+
+impl PeerEventProducer for PeerStream {
+    fn receive(&mut self) -> Result<tonic_lnd::lnrpc::PeerEvent, Status> {
+        match block_on(self.peer_subscription.message()) {
+            Ok(event) => match event {
+                Some(peer_event) => Ok(peer_event),
+                None => Err(Status::unknown("no event provided")),
+            },
+            Err(e) => Err(Status::unknown(format!("streaming error: {e}"))),
+        }
+    }
+}
+
 fn produce_peer_events(
     mut source: impl PeerEventProducer,
     events: Sender<MessengerEvents>,
