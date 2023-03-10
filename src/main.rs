@@ -4,7 +4,9 @@ use bitcoin::secp256k1::ecdsa::{RecoverableSignature, Signature};
 use bitcoin::secp256k1::{self, PublicKey, Scalar, Secp256k1};
 use futures::executor::block_on;
 use lightning::chain::keysinterface::{EntropySource, KeyMaterial, NodeSigner, Recipient};
+use lightning::ln::features::InitFeatures;
 use lightning::ln::msgs::UnsignedGossipMessage;
+use lightning::ln::msgs::{Init, OnionMessageHandler};
 use lightning::ln::peer_handler::IgnoringMessageHandler;
 use lightning::onion_message::OnionMessenger;
 use lightning::util::logger::{Level, Logger, Record};
@@ -14,7 +16,9 @@ use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
+use std::marker::Copy;
 use std::str::FromStr;
+use std::sync::mpsc::Receiver;
 use tonic_lnd::{Client, ConnectError};
 
 #[tokio::main]
@@ -45,6 +49,79 @@ async fn main() {
         &messenger_utils,
         IgnoringMessageHandler {},
     );
+}
+
+#[derive(Debug, Copy, Clone)]
+enum Producer {
+    PeerEvents,
+}
+
+impl fmt::Display for Producer {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Producer::PeerEvents => write!(f, "Peer events"),
+        }
+    }
+}
+
+// MessengerEvents represents all of the events that are relevant to onion messages.
+#[derive(Debug, Copy, Clone)]
+enum MessengerEvents {
+    PeerConnected(PublicKey, bool),
+    PeerDisconnected(PublicKey),
+    ProducerExit(Producer),
+}
+
+impl fmt::Display for MessengerEvents {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            MessengerEvents::PeerConnected(p, o) => {
+                write!(f, "{p} connected, onion message support: {o}")
+            }
+            MessengerEvents::PeerDisconnected(p) => write!(f, "{p} disconnected"),
+            MessengerEvents::ProducerExit(s) => write!(f, "Producer {s} exited"),
+        }
+    }
+}
+
+// consume_messenger_events receives a series of events and delivers them to the onion messenger provided.
+fn consume_messenger_events(
+    onion_messenger: impl OnionMessageHandler,
+    events: Receiver<MessengerEvents>,
+) -> Result<(), String> {
+    loop {
+        match events.recv() {
+            Ok(onion_event) => match onion_event {
+                MessengerEvents::PeerConnected(pubkey, onion_support) => {
+                    let init_features = if onion_support {
+                        let onion_message_optional: u64 = 1 << 39;
+                        InitFeatures::from_le_bytes(onion_message_optional.to_le_bytes().to_vec())
+                    } else {
+                        InitFeatures::empty()
+                    };
+
+                    if onion_messenger
+                        .peer_connected(
+                            &pubkey,
+                            &Init {
+                                features: init_features,
+                                remote_network_address: None,
+                            },
+                            false,
+                        )
+                        .is_err()
+                    {
+                        return Err("peer connection failed".to_string());
+                    };
+                }
+                MessengerEvents::PeerDisconnected(pubkey) => {
+                    onion_messenger.peer_disconnected(&pubkey)
+                }
+                MessengerEvents::ProducerExit(e) => return Err(format!("upstream exit: {e}")),
+            },
+            Err(e) => return Err(format!("message consumer failed: {e}")),
+        };
+    }
 }
 
 struct LndNodeSigner<'a> {
