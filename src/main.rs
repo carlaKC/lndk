@@ -5,8 +5,7 @@ use bitcoin::secp256k1::{self, PublicKey, Scalar, Secp256k1};
 use futures::executor::block_on;
 use lightning::chain::keysinterface::{EntropySource, KeyMaterial, NodeSigner, Recipient};
 use lightning::ln::features::InitFeatures;
-use lightning::ln::msgs::UnsignedGossipMessage;
-use lightning::ln::msgs::{Init, OnionMessageHandler};
+use lightning::ln::msgs::{Init, OnionMessageHandler, UnsignedGossipMessage};
 use lightning::ln::peer_handler::IgnoringMessageHandler;
 use lightning::onion_message::OnionMessenger;
 use lightning::util::logger::{Level, Logger, Record};
@@ -46,6 +45,26 @@ async fn main() {
 
     // Setup channels that we'll use to communicate onion messenger events.
     let (sender, receiver) = channel();
+
+    // Subscribe to peer events from LND first thing so that we don't miss any online/offline events while we are
+    // starting up. The onion messenger can handle superfluous online/offline reports, so it's okay if this ends
+    // up creating some duplicate events. The event subscription from LND blocks until it gets its first event (which
+    // could take very long), so we get the subscription itself inside of our producer thread.
+    let mut peers_client = client.lightning().clone();
+    let peer_sender = Sender::clone(&sender);
+
+    let peer_events_handler = thread::spawn(move || {
+        let peer_subscription = block_on(
+            peers_client.subscribe_peer_events(tonic_lnd::lnrpc::PeerEventSubscription {}),
+        )
+        .expect("peer subscription failed")
+        .into_inner();
+
+        match produce_peer_events(PeerStream { peer_subscription }, peer_sender) {
+            Ok(_) => debug!("Peer events producer exited"),
+            Err(e) => error!("Peer events producer exited: {e}"),
+        };
+    });
 
     // On startup, we want to get a list of our currently online peers to notify the onion messenger that they are
     // connected. This sets up our "start state" for the messenger correctly.
@@ -91,6 +110,7 @@ async fn main() {
     });
 
     messenger_events_handler.join().unwrap();
+    peer_events_handler.join().unwrap();
 }
 
 #[derive(Debug)]
