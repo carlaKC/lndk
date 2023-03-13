@@ -9,5 +9,7 @@ edition = "2021"
 bitcoin = "0.29.2"
 futures = "0.3.26"
 lightning = "0.0.114"
+log = "0.4.17"
+simple_logger = "4.0.0"
 tokio = { version = "1.25.0", features = ["rt", "rt-multi-thread"] }
 tonic_lnd = { git = "https://github.com/Kixunil/tonic_lnd", rev = "c30b614" } 
