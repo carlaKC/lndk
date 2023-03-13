@@ -3,16 +3,29 @@ use bitcoin::secp256k1::ecdh::SharedSecret;
 use bitcoin::secp256k1::ecdsa::{RecoverableSignature, Signature};
 use bitcoin::secp256k1::{self, PublicKey, Scalar, Secp256k1};
 use futures::executor::block_on;
-use lightning::chain::keysinterface::{KeyMaterial, NodeSigner, Recipient};
-use lightning::ln::msgs::UnsignedGossipMessage;
+use lightning::chain::keysinterface::{EntropySource, KeyMaterial, NodeSigner, Recipient};
+use lightning::ln::features::InitFeatures;
+use lightning::ln::msgs::{Init, OnionMessageHandler, UnsignedGossipMessage};
+use lightning::ln::peer_handler::IgnoringMessageHandler;
+use lightning::onion_message::OnionMessenger;
+use lightning::util::logger::{Level, Logger, Record};
+use log::{debug, error, info, trace, warn};
 use std::cell::RefCell;
 use std::error::Error;
 use std::fmt;
+use std::fs::File;
+use std::io::Read;
+use std::marker::Copy;
 use std::str::FromStr;
+use std::sync::mpsc::{channel, Receiver, SendError, Sender};
+use std::thread;
+use tonic_lnd::tonic::Status;
 use tonic_lnd::{Client, ConnectError};
 
 #[tokio::main]
 async fn main() {
+    simple_logger::init_with_level(log::Level::Info).unwrap();
+
     let args = match parse_args() {
         Ok(args) => args,
         Err(args) => panic!("Bad arguments: {args}"),
@@ -20,16 +33,238 @@ async fn main() {
 
     let mut client = get_lnd_client(args).expect("failed to connect");
 
-    let info = client
-        .lightning()
-        .get_info(tonic_lnd::lnrpc::GetInfoRequest {})
-        .await
-        .expect("failed to get info");
+    let info = block_on(
+        client
+            .lightning()
+            .get_info(tonic_lnd::lnrpc::GetInfoRequest {}),
+    )
+    .expect("failed to get info");
 
     let pubkey = PublicKey::from_str(&info.into_inner().identity_pubkey).unwrap();
-    println!("Starting lndk for node: {pubkey}");
+    info!("Starting lndk for node: {pubkey}");
 
-    let _node_signer = LndNodeSigner::new(pubkey, client.signer());
+    // Setup channels that we'll use to communicate onion messenger events.
+    let (sender, receiver) = channel();
+
+    // Subscribe to peer events from LND first thing so that we don't miss any online/offline events while we are
+    // starting up. The onion messenger can handle superfluous online/offline reports, so it's okay if this ends
+    // up creating some duplicate events. The event subscription from LND blocks until it gets its first event (which
+    // could take very long), so we get the subscription itself inside of our producer thread.
+    let mut peers_client = client.lightning().clone();
+    let peer_sender = Sender::clone(&sender);
+
+    let peer_events_handler = thread::spawn(move || {
+        let peer_subscription = block_on(
+            peers_client.subscribe_peer_events(tonic_lnd::lnrpc::PeerEventSubscription {}),
+        )
+        .expect("peer subscription failed")
+        .into_inner();
+
+        match produce_peer_events(PeerStream { peer_subscription }, peer_sender) {
+            Ok(_) => debug!("Peer events producer exited"),
+            Err(e) => error!("Peer events producer exited: {e}"),
+        };
+    });
+
+    // On startup, we want to get a list of our currently online peers to notify the onion messenger that they are
+    // connected. This sets up our "start state" for the messenger correctly.
+    let list_peers = block_on(
+        client
+            .lightning()
+            .list_peers(tonic_lnd::lnrpc::ListPeersRequest {
+                latest_error: false,
+            }),
+    )
+    .expect("list peers failed")
+    .into_inner();
+
+    for peer in list_peers.peers {
+        let event = MessengerEvents::PeerConnected(
+            PublicKey::from_str(&peer.pub_key).unwrap(),
+            peer.inbound,
+        );
+
+        match sender.send(event) {
+            Ok(_) => debug!("startup peer events sent: {event}"),
+            Err(err) => panic!("could not send peer event on startup {event}: {err}"),
+        };
+    }
+
+    // Create an onion messenger that depends on LND's signer client and consume related events.
+    let mut node_signer_client = client.signer().clone();
+    let messenger_events_handler = thread::spawn(move || {
+        let node_signer = LndNodeSigner::new(pubkey, &mut node_signer_client);
+
+        let messenger_utils = MessengerUtilities {};
+        let onion_messenger = OnionMessenger::new(
+            &messenger_utils,
+            &node_signer,
+            &messenger_utils,
+            IgnoringMessageHandler {},
+        );
+
+        match consume_messenger_events(onion_messenger, receiver) {
+            Ok(_) => debug!("Onion message events consumer exited"),
+            Err(e) => error!("Onion message events consumer exited: {e}"),
+        };
+    });
+
+    messenger_events_handler.join().unwrap();
+    peer_events_handler.join().unwrap();
+}
+
+#[derive(Debug)]
+enum MessengerError {
+    SendError(SendError<MessengerEvents>),
+    StreamError(MessengerEvents),
+}
+
+impl Error for MessengerError {}
+
+impl fmt::Display for MessengerError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            MessengerError::SendError(e) => write!(f, "Error sending messenger event: {e}"),
+            MessengerError::StreamError(s) => write!(f, "LND stream {s} exited"),
+        }
+    }
+}
+
+trait PeerEventProducer {
+    fn receive(&mut self) -> Result<tonic_lnd::lnrpc::PeerEvent, Status>;
+}
+
+struct PeerStream {
+    peer_subscription: tonic_lnd::tonic::Streaming<tonic_lnd::lnrpc::PeerEvent>,
+}
+
+impl PeerEventProducer for PeerStream {
+    fn receive(&mut self) -> Result<tonic_lnd::lnrpc::PeerEvent, Status> {
+        match block_on(self.peer_subscription.message()) {
+            Ok(event) => match event {
+                Some(peer_event) => Ok(peer_event),
+                None => Err(Status::unknown("no event provided")),
+            },
+            Err(e) => Err(Status::unknown(format!("streaming error: {e}"))),
+        }
+    }
+}
+
+fn produce_peer_events(
+    mut source: impl PeerEventProducer,
+    events: Sender<MessengerEvents>,
+) -> Result<(), MessengerError> {
+    loop {
+        match source.receive() {
+            Ok(peer_event) => match peer_event.r#type() {
+                tonic_lnd::lnrpc::peer_event::EventType::PeerOnline => {
+                    // TODO: need to lookup whether the peer supports onion messaging (describegraph?) to provide input
+                    // here.
+                    let event = MessengerEvents::PeerConnected(
+                        PublicKey::from_str(&peer_event.pub_key).unwrap(),
+                        true,
+                    );
+                    match events.send(event) {
+                        Ok(_) => debug!("peer events sent: {event}"),
+                        Err(err) => return Err(MessengerError::SendError(err)),
+                    };
+                }
+                tonic_lnd::lnrpc::peer_event::EventType::PeerOffline => {
+                    let event = MessengerEvents::PeerDisconnected(
+                        PublicKey::from_str(&peer_event.pub_key).unwrap(),
+                    );
+                    match events.send(event) {
+                        Ok(_) => debug!("peer events sent: {event}"),
+                        Err(err) => return Err(MessengerError::SendError(err)),
+                    };
+                }
+            },
+            Err(s) => {
+                debug!("peer events receive failed: {s}");
+
+                let event = MessengerEvents::ProducerExit(Producer::PeerEvents);
+                match events.send(event) {
+                    Ok(_) => debug!("peer events sent: {event}"),
+                    Err(err) => error!("peer events: send producer exit failed: {err}"),
+                }
+
+                return Err(MessengerError::StreamError(event));
+            }
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+enum Producer {
+    PeerEvents,
+}
+
+impl fmt::Display for Producer {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Producer::PeerEvents => write!(f, "Peer events"),
+        }
+    }
+}
+
+// MessengerEvents represents all of the events that are relevant to onion messages.
+#[derive(Debug, Copy, Clone)]
+enum MessengerEvents {
+    PeerConnected(PublicKey, bool),
+    PeerDisconnected(PublicKey),
+    ProducerExit(Producer),
+}
+
+impl fmt::Display for MessengerEvents {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            MessengerEvents::PeerConnected(p, o) => {
+                write!(f, "{p} connected, onion message support: {o}")
+            }
+            MessengerEvents::PeerDisconnected(p) => write!(f, "{p} disconnected"),
+            MessengerEvents::ProducerExit(s) => write!(f, "Producer {s} exited"),
+        }
+    }
+}
+
+// consume_messenger_events receives a series of events and delivers them to the onion messenger provided.
+fn consume_messenger_events(
+    onion_messenger: impl OnionMessageHandler,
+    events: Receiver<MessengerEvents>,
+) -> Result<(), String> {
+    loop {
+        match events.recv() {
+            Ok(onion_event) => match onion_event {
+                MessengerEvents::PeerConnected(pubkey, onion_support) => {
+                    let init_features = if onion_support {
+                        let onion_message_optional: u64 = 1 << 39;
+                        InitFeatures::from_le_bytes(onion_message_optional.to_le_bytes().to_vec())
+                    } else {
+                        InitFeatures::empty()
+                    };
+
+                    if onion_messenger
+                        .peer_connected(
+                            &pubkey,
+                            &Init {
+                                features: init_features,
+                                remote_network_address: None,
+                            },
+                            false,
+                        )
+                        .is_err()
+                    {
+                        return Err("peer connection failed".to_string());
+                    };
+                }
+                MessengerEvents::PeerDisconnected(pubkey) => {
+                    onion_messenger.peer_disconnected(&pubkey)
+                }
+                MessengerEvents::ProducerExit(e) => return Err(format!("upstream exit: {e}")),
+            },
+            Err(e) => return Err(format!("message consumer failed: {e}")),
+        };
+    }
 }
 
 struct LndNodeSigner<'a> {
@@ -118,6 +353,32 @@ impl<'a> NodeSigner for LndNodeSigner<'a> {
 
     fn sign_gossip_message(&self, _msg: UnsignedGossipMessage) -> Result<Signature, ()> {
         unimplemented!("not required for onion messaging");
+    }
+}
+
+// MessengerUtilities implements some utilites required for onion messenging.
+struct MessengerUtilities {}
+
+impl EntropySource for MessengerUtilities {
+    fn get_secure_random_bytes(&self) -> [u8; 32] {
+        let mut f = File::open("/dev/urandom").unwrap();
+        let mut buf = [0u8; 32];
+        f.read_exact(&mut buf).unwrap();
+        buf
+    }
+}
+
+impl Logger for MessengerUtilities {
+    fn log(&self, record: &Record) {
+        let args_str = record.args.to_string();
+        match record.level {
+            Level::Gossip => {}
+            Level::Trace => trace!("{}", args_str),
+            Level::Debug => debug!("{}", args_str),
+            Level::Info => info!("{}", args_str),
+            Level::Warn => warn!("{}", args_str),
+            Level::Error => error!("{}", args_str),
+        }
     }
 }
 
