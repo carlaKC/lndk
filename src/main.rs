@@ -18,7 +18,8 @@ use std::fs::File;
 use std::io::Read;
 use std::marker::Copy;
 use std::str::FromStr;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{channel, Receiver};
+use std::thread;
 use tonic_lnd::{Client, ConnectError};
 
 #[tokio::main]
@@ -32,23 +33,63 @@ async fn main() {
 
     let mut client = get_lnd_client(args).expect("failed to connect");
 
-    let info = client
-        .lightning()
-        .get_info(tonic_lnd::lnrpc::GetInfoRequest {})
-        .await
-        .expect("failed to get info");
+    let info = block_on(
+        client
+            .lightning()
+            .get_info(tonic_lnd::lnrpc::GetInfoRequest {}),
+    )
+    .expect("failed to get info");
 
     let pubkey = PublicKey::from_str(&info.into_inner().identity_pubkey).unwrap();
     info!("Starting lndk for node: {pubkey}");
 
-    let node_signer = LndNodeSigner::new(pubkey, client.signer());
-    let messenger_utils = MessengerUtilities {};
-    let _onion_messenger = OnionMessenger::new(
-        &messenger_utils,
-        &node_signer,
-        &messenger_utils,
-        IgnoringMessageHandler {},
-    );
+    // Setup channels that we'll use to communicate onion messenger events.
+    let (sender, receiver) = channel();
+
+    // On startup, we want to get a list of our currently online peers to notify the onion messenger that they are
+    // connected. This sets up our "start state" for the messenger correctly.
+    let list_peers = block_on(
+        client
+            .lightning()
+            .list_peers(tonic_lnd::lnrpc::ListPeersRequest {
+                latest_error: false,
+            }),
+    )
+    .expect("list peers failed")
+    .into_inner();
+
+    for peer in list_peers.peers {
+        let event = MessengerEvents::PeerConnected(
+            PublicKey::from_str(&peer.pub_key).unwrap(),
+            peer.inbound,
+        );
+
+        match sender.send(event) {
+            Ok(_) => debug!("startup peer events sent: {event}"),
+            Err(err) => panic!("could not send peer event on startup {event}: {err}"),
+        };
+    }
+
+    // Create an onion messenger that depends on LND's signer client and consume related events.
+    let mut node_signer_client = client.signer().clone();
+    let messenger_events_handler = thread::spawn(move || {
+        let node_signer = LndNodeSigner::new(pubkey, &mut node_signer_client);
+
+        let messenger_utils = MessengerUtilities {};
+        let onion_messenger = OnionMessenger::new(
+            &messenger_utils,
+            &node_signer,
+            &messenger_utils,
+            IgnoringMessageHandler {},
+        );
+
+        match consume_messenger_events(onion_messenger, receiver) {
+            Ok(_) => debug!("Onion message events consumer exited"),
+            Err(e) => error!("Onion message events consumer exited: {e}"),
+        };
+    });
+
+    messenger_events_handler.join().unwrap();
 }
 
 #[derive(Debug, Copy, Clone)]
